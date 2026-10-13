@@ -3,9 +3,10 @@
 import { codexTransport } from "./codex-transport.ts";
 import { timingSafeEqual } from "node:crypto";
 import { SignedOutError } from "./common.ts";
+import { CLAUDE_ROUTES, forwardClaude, type ClaudeRouteOptions } from "./claude-proxy.ts";
 
 export type ProxyCredential = { name: string; accessToken: string; accountId: string };
-export type ProxyObservation = { profile: string; path: string; status: number; session: string | null; at: string; failure?: string; bytes?: number; wireBytes?: number; elapsedMs?: number; encoding?: string | null };
+export type ProxyObservation = { profile: string; provider?: "claude"; path: string; status: number; session: string | null; at: string; failure?: string; bytes?: number; wireBytes?: number; elapsedMs?: number; encoding?: string | null };
 // 401, not 5xx: a revoked sign-in will not recover on retry.
 const signedOut = (e: SignedOutError) => Response.json({ error: { message: `Router account ${e.message}; no other account was used` } }, { status: 401 });
 
@@ -16,6 +17,8 @@ export function createProxyHandler(options: {
   observe?: (event: ProxyObservation) => void;
   status?: () => unknown;
   meter?: (credential: ProxyCredential, signal?: AbortSignal) => Promise<(response: Response) => Response>;
+  // Optional: absent, the Claude paths stay 404 exactly as before.
+  claude?: ClaudeRouteOptions;
 }) {
   const upstream = options.upstream ?? codexTransport;
   const observe = (event: ProxyObservation) => {
@@ -33,7 +36,15 @@ export function createProxyHandler(options: {
       return Response.json({ error: { message: "Router proxy authentication required" } }, { status: 401 });
     }
     if (url.pathname === "/health" && request.method === "GET") {
-      return Response.json({ ...(options.status?.() as object ?? {}), service: "router-codex-proxy", separateClientAuth: true });
+      return Response.json({ ...(options.status?.() as object ?? {}), service: "router-codex-proxy", separateClientAuth: true, claudeRoute: !!options.claude });
+    }
+    // REASON: the Claude route sits behind the SAME client-token check above.
+    // Claude Code sends the proxy token as ANTHROPIC_AUTH_TOKEN (Authorization:
+    // Bearer) or as an x-router-token custom header; either way it is a
+    // Router-only secret, never a Claude credential, and is stripped before
+    // forwarding. Only POST is routed: no GET/WebSocket surface for Claude.
+    if (options.claude && request.method === "POST" && CLAUDE_ROUTES.has(url.pathname) && !request.headers.has("upgrade")) {
+      return forwardClaude(request, url, { ...options.claude, observe });
     }
     const allowed = (request.method === "POST" && ["/v1/responses", "/v1/responses/compact"].includes(url.pathname))
       || (request.method === "GET" && url.pathname === "/v1/models");

@@ -24,6 +24,7 @@
 
 import { mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { userInfo } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
 
 import * as codex from "./codex.ts";
@@ -53,7 +54,9 @@ const ACCOUNT_STASH_FILE = join(DIR, "stash-account.json");
 const SERVICE = "router";
 const STASH_SERVICE = "router-stash";
 const CLAUDE_SERVICE = "Claude Code-credentials";
-const CLAUDE_ACCOUNT = process.env.USER ?? "";
+// REASON: the proxy LaunchAgent's environment sets only HOME and PATH, so
+// USER can be missing there; the keychain item's account is the login name.
+const CLAUDE_ACCOUNT = process.env.USER || userInfo().username;
 const CLAUDE_JSON = join(HOME, ".claude.json");
 const MAIN = "main";
 const TOKEN_RE = /^sk-ant-oat01-[A-Za-z0-9_.-]+$/;
@@ -483,6 +486,87 @@ async function meteringCredentials(): Promise<MeterCredential[]> {
     } catch { /* Signed out, or no usable credential to prove. */ }
   }
   return result;
+}
+
+// --- runner proxy credential --------------------------------------------------
+
+// The access token the loopback proxy substitutes for a runner's Claude
+// request: the Mac's ACTIVE profile (or `requested`, when renewing the profile
+// a request already used). Only access tokens leave this function; refresh
+// tokens stay in the Mac keychain and the Mac is the only refresh authority.
+const proxyCache = new Map<string, { token: string; expiresAt?: number; readAt: number }>();
+const PROXY_CACHE_MS = 30_000; // Same staleness window Claude Code itself tolerates for a switch.
+const usable = (expiresAt?: number) => typeof expiresAt !== "number" || expiresAt > Date.now() + 60_000;
+
+function mainSource(): { service: string; account: string; item: ClaudeItem } | null {
+  const live = readClaudeItem();
+  if (isMainFamily(live)) return { service: CLAUDE_SERVICE, account: CLAUDE_ACCOUNT, item: live! };
+  const stash = readStash();
+  return isMainFamily(stash) ? { service: STASH_SERVICE, account: MAIN, item: stash! } : null;
+}
+
+// REASON: "main" is the real Claude Code login, refreshed by every Claude Code
+// session on this Mac. Refresh tokens rotate, so a second refresher racing them
+// could invalidate the pair and sign the Mac out. The proxy therefore refreshes
+// main ONLY once its access token has actually expired (an active Mac session
+// would have renewed it minutes earlier), re-reads the keychain first and after
+// a failure, and writes the renewed pair back to the same keychain item the way
+// Claude Code does, so Mac sessions adopt it on their next credential read.
+async function mainProxyToken(): Promise<{ token: string; expiresAt?: number }> {
+  const source = mainSource();
+  const oauth = source?.item.claudeAiOauth;
+  if (!source || typeof oauth?.accessToken !== "string") throw new Error("main Claude login missing on the Mac");
+  // An unexpired main token is returned as-is even after a 401: the re-read
+  // above already picked up any token a Mac session renewed meanwhile.
+  if (usable(oauth.expiresAt)) return { token: oauth.accessToken, expiresAt: oauth.expiresAt };
+  const { body } = await postRefresh(oauth.refreshToken, Array.isArray(oauth.scopes) ? oauth.scopes : SCOPES);
+  const latest = mainSource();
+  if (!body) {
+    const other = latest?.item.claudeAiOauth;
+    if (other && other.accessToken !== oauth.accessToken && usable(other.expiresAt)) return { token: other.accessToken, expiresAt: other.expiresAt };
+    // Never markSignedOut here: main is managed by Claude Code's /login.
+    throw new Error("main Claude login could not be renewed; run claude on the Mac");
+  }
+  // Re-read just before writing so concurrent edits (mcpOAuth) survive.
+  const item = latest && latest.service === source.service ? latest.item : source.item;
+  item.claudeAiOauth = {
+    ...item.claudeAiOauth,
+    accessToken: body.access_token,
+    refreshToken: body.refresh_token ?? oauth.refreshToken,
+    expiresAt: typeof body.expires_in === "number" ? Date.now() + body.expires_in * 1000 : item.claudeAiOauth?.expiresAt,
+    scopes: parseScope(body.scope) ?? item.claudeAiOauth?.scopes,
+  };
+  keychainWrite(source.service, source.account, JSON.stringify(item));
+  return { token: body.access_token, expiresAt: item.claudeAiOauth.expiresAt };
+}
+
+async function claudeProxyCredential(requested?: string, refresh = false): Promise<{ name: string; accessToken: string }> {
+  const name = requested ?? currentName();
+  const hit = proxyCache.get(name);
+  if (!refresh && hit && Date.now() - hit.readAt < PROXY_CACHE_MS && usable(hit.expiresAt)) return { name, accessToken: hit.token };
+  const rejected = refresh ? hit?.token ?? null : null;
+  let next: { token: string; expiresAt?: number };
+  if (name === MAIN) next = await mainProxyToken();
+  else {
+    const profile = loadProfiles()[name];
+    if (!profile) throw new Error(`no Claude profile "${name}"`);
+    if (profile.signedOutAt) throw new SignedOutError(name);
+    let stored = readToken(name);
+    if (!stored) throw new Error(`Claude profile "${name}" has no keychain token`);
+    // Renew a router-owned profile when it is near expiry, or when Anthropic
+    // rejected exactly the token still stored (heal did not replace it).
+    if (!usable(stored.expiresAt) || (rejected !== null && rejected === stored.accessToken)) {
+      const renewed = await refreshStoredToken(name, stored);
+      if (!renewed) {
+        if (loadProfiles()[name]?.signedOutAt) throw new SignedOutError(name);
+        throw new Error(`Claude profile "${name}" could not be renewed`);
+      }
+      stored = renewed;
+    }
+    next = { token: stored.accessToken, expiresAt: stored.expiresAt };
+  }
+  proxyCache.set(name, { ...next, readAt: Date.now() });
+  return { name, accessToken: next.token };
 }
 
 // --- commands -----------------------------------------------------------------
@@ -967,7 +1051,7 @@ usage:
   router meter login     sign in personally for shared usage tracking
   router meter dashboard open shared subscription usage (returns a URL)
   router meter status    show sign-in, sync health, and queued usage
-  router proxy install   start the local Codex routing service
+  router proxy install   start the local Codex (and runner Claude) routing service
   router proxy enable    route Codex requests through Router
   router proxy disable   restore the previous Codex provider
   router proxy status    show recent routing results (no prompts or tokens)
@@ -988,7 +1072,7 @@ try {
       });
       process.exit(await child.exited);
     }
-    case "proxy": await proxyCommand(rest); break;
+    case "proxy": await proxyCommand(rest, claudeProxyCredential); break;
     case "meter": await meterCommand(rest, meteringCredentials); break;
     case "add": await cmdAdd(rest); break;
     case "use": cmdUse(rest); break;

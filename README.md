@@ -184,6 +184,33 @@ switches. Do not share the managed provider block; it contains a local secret.
 `router doctor` checks for the legacy auth configuration, mismatched local
 tokens, and an outdated proxy service, and prints the repair command.
 
+### Claude Code on a remote runner (Claude route)
+
+The same service also routes Claude Code, for Linux machines that cannot hold
+macOS keychain credentials. Forward the loopback port over SSH from the Mac
+(`ssh -N -R 127.0.0.1:18789:127.0.0.1:18789 <runner>`), copy the client token
+into the runner's owner-only `~/.router/codex-proxy.token` through SSH stdin,
+and start Claude Code there with:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:18789 \
+ANTHROPIC_AUTH_TOKEN="$(cat ~/.router/codex-proxy.token)" claude -p "say ok"
+```
+
+`ANTHROPIC_AUTH_TOKEN` carries only the Router client token (an
+`x-router-token` header via `ANTHROPIC_CUSTOM_HEADERS` works too). Router
+accepts only `POST /v1/messages` and `POST /v1/messages/count_tokens`, drops
+every client credential header, and sends the request to `api.anthropic.com`
+with the access token of the Mac's active Claude account (`router use`) plus
+the `oauth-2025-04-20` beta. Responses, including SSE streams and 429
+rate-limit headers, pass through unchanged, with no fallback to another
+account. The Mac remains the only refresh authority. A runner never receives a
+refresh token or an access token, and nothing is written to its disk except the
+client token. The real `main` login is refreshed only after its access token
+has expired, because every Claude Code session on the Mac refreshes it too.
+`router proxy status` lists recent Claude requests (route, status, profile,
+sizes) next to Codex ones, never prompts or tokens.
+
 Regression checks run on pushes and pull requests through GitHub Actions:
 `bun test cli metering`, `python3 -m unittest discover -s cli/tests -p '*integration.py' -v`,
 and the Swift build/reset checks. They cover both authentication modes,

@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { DIR, HOME, ensureDir, exitOnSigterm, reloadLaunchAgent } from "./common.ts";
 import { beginMeter } from "./meter-client.ts";
 import { createProxyHandler, type ProxyObservation } from "./codex-proxy.ts";
+import type { ClaudeRouteOptions } from "./claude-proxy.ts";
 import { proxyCredential, proxySelection, enableProxySelection, disableProxySelection } from "./codex.ts";
 
 const SETTINGS = join(DIR, "codex-proxy.json");
@@ -123,7 +124,10 @@ export async function proxyDoctor(report: (good: boolean, message: string) => vo
   }
 }
 
-export async function proxyCommand(args: string[]) {
+// router.ts owns Claude profiles and keychain items, so it passes the Claude
+// credential source in (as it does for metering) instead of this module
+// importing router.ts, whose top level runs the CLI.
+export async function proxyCommand(args: string[], claudeCredential?: ClaudeRouteOptions["credential"]) {
   const command = args[0];
   if (command === "token") { process.stdout.write(token()); return; }
   if (command === "serve") {
@@ -135,6 +139,8 @@ export async function proxyCommand(args: string[]) {
     const server = Bun.serve({ hostname: "127.0.0.1", port, idleTimeout: 0, maxRequestBodySize: 64 * 1024 * 1024,
       fetch: createProxyHandler({ token: token(), credential: proxyCredential, status,
         meter: (credential,signal) => beginMeter({ provider: "codex", profile: credential.name, accessToken: credential.accessToken, accountId: credential.accountId },signal),
+        claude: claudeCredential && { credential: claudeCredential,
+          meter: (credential, signal) => beginMeter({ provider: "claude", profile: credential.name, accessToken: credential.accessToken }, signal) },
         observe(event) {
           requests++;
           recent.push(event);
